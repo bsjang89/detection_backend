@@ -16,12 +16,14 @@ class Settings(BaseSettings):
 
     # File Storage
     UPLOAD_DIR: str = "uploads"
+    THUMBNAIL_SIZE: int = 256
     MODELS_DIR: str = "trained_models"
+    NETWORK_DIR: str = "network"
     RESULTS_DIR: str = "results"
     REPORTS_DIR: str = "reports"
 
     # Training Defaults
-    DEFAULT_EPOCHS: int = 100
+    DEFAULT_EPOCHS: int = 50
     DEFAULT_BATCH_SIZE: int = 16
     DEFAULT_IMG_SIZE: int = 640
 

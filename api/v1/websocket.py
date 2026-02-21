@@ -1,11 +1,7 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from sqlalchemy.orm import Session
-from typing import Dict, Set
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from typing import Dict, Set, Optional
 import json
 import asyncio
-
-from config.database import get_db
-from models.database import TrainingSession
 
 router = APIRouter()
 
@@ -18,10 +14,12 @@ class ConnectionManager:
     def __init__(self):
         # Map: training_session_id -> set of WebSocket connections
         self.active_connections: Dict[int, Set[WebSocket]] = {}
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def connect(self, websocket: WebSocket, training_session_id: int):
         """Accept and register a WebSocket connection"""
         await websocket.accept()
+        self.loop = asyncio.get_running_loop()
 
         if training_session_id not in self.active_connections:
             self.active_connections[training_session_id] = set()
@@ -59,6 +57,26 @@ class ConnectionManager:
                 print(f"Error broadcasting to client: {e}")
                 # Remove dead connection
                 self.disconnect(connection, training_session_id)
+
+    def broadcast_from_thread(self, message: dict, training_session_id: int):
+        """
+        Thread-safe broadcast helper for non-async callers (e.g. training thread).
+        """
+        if self.loop is None or self.loop.is_closed():
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.broadcast(message, training_session_id),
+            self.loop
+        )
+
+        def _log_error(fut):
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"Thread-safe broadcast failed: {e}")
+
+        future.add_done_callback(_log_error)
 
 
 # Global connection manager
@@ -138,6 +156,21 @@ async def broadcast_training_update(
     await manager.broadcast(message, training_session_id)
 
 
+def broadcast_training_update_sync(
+    training_session_id: int,
+    epoch: int,
+    metrics: dict
+):
+    """Thread-safe wrapper for broadcasting training updates from sync contexts."""
+    message = {
+        "type": "epoch_update",
+        "training_session_id": training_session_id,
+        "epoch": epoch,
+        "metrics": metrics
+    }
+    manager.broadcast_from_thread(message, training_session_id)
+
+
 async def broadcast_status_update(
     training_session_id: int,
     status: str,
@@ -159,3 +192,18 @@ async def broadcast_status_update(
     }
 
     await manager.broadcast(msg, training_session_id)
+
+
+def broadcast_status_update_sync(
+    training_session_id: int,
+    status: str,
+    message: str = None
+):
+    """Thread-safe wrapper for broadcasting status updates from sync contexts."""
+    msg = {
+        "type": "status_update",
+        "training_session_id": training_session_id,
+        "status": status,
+        "message": message
+    }
+    manager.broadcast_from_thread(msg, training_session_id)

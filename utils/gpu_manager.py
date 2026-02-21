@@ -1,5 +1,5 @@
 import torch
-from typing import Dict
+from typing import Dict, Union
 from config.settings import settings
 
 
@@ -19,6 +19,12 @@ class GPUManager:
     def get_training_gpu(cls) -> int:
         """Get GPU ID for training"""
         return settings.TRAINING_GPU_ID
+
+    @classmethod
+    def get_training_device(cls) -> Union[int, str]:
+        """Get training device, falling back to CPU when configured GPU is unavailable."""
+        gpu_id = cls.get_training_gpu()
+        return gpu_id if cls.check_gpu_available(gpu_id) else "cpu"
 
     @classmethod
     def get_inference_gpu(cls) -> int:

@@ -23,6 +23,7 @@ class ImageResponse(ImageBase):
     id: int
     project_id: int
     file_path: str
+    thumbnail_path: Optional[str] = None
     split_type: SplitType
     uploaded_at: datetime
 

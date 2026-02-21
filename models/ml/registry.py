@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Dict, Type, Union
 from .base import BaseDetectionModel
 from .yolo_bbox import YOLOBBoxModel
 from .yolo_obb import YOLOOBBModel
@@ -42,7 +42,7 @@ class ModelRegistry:
         cls,
         task_type: str,
         model_type: str,
-        device: int = 0
+        device: Union[int, str] = 0
     ) -> BaseDetectionModel:
         """
         Factory method to create a detection model.
@@ -50,7 +50,7 @@ class ModelRegistry:
         Args:
             task_type: 'bbox' or 'obb'
             model_type: Model variant (e.g., 'yolov8n', 'yolov8s', etc.)
-            device: GPU device ID
+            device: GPU device ID or "cpu"
 
         Returns:
             Instantiated model

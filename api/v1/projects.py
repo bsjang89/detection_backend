@@ -3,13 +3,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
 import shutil
-import os
 from pathlib import Path
 from PIL import Image as PILImage
 
 from config.database import get_db
 from config.settings import settings
 from models.database import Project, Image, Annotation, Class, SplitType
+from utils.file_handler import create_thumbnail, get_project_images_dir, get_thumbnail_path, safe_filename
 from schemas import (
     ProjectCreate,
     ProjectUpdate,
@@ -200,14 +200,23 @@ async def upload_images(
             detail=f"Project {project_id} not found"
         )
 
-    project_dir = Path(settings.UPLOAD_DIR) / str(project_id) / "images"
-    project_dir.mkdir(parents=True, exist_ok=True)
+    project_images_dir = get_project_images_dir(project_id)
+    project_images_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded_images = []
 
     for file in files:
-        # Save file
-        file_path = project_dir / file.filename
+        normalized_name = safe_filename(file.filename or "")
+        if not normalized_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid image filename"
+            )
+
+        file_path = project_images_dir / normalized_name
+        thumbnail_path = get_thumbnail_path(project_id, normalized_name)
+
+        # Save original file
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
@@ -215,16 +224,21 @@ async def upload_images(
         try:
             with PILImage.open(file_path) as img:
                 width, height = img.size
+            create_thumbnail(file_path, thumbnail_path, settings.THUMBNAIL_SIZE)
         except Exception as e:
+            if file_path.exists():
+                file_path.unlink()
+            if thumbnail_path.exists():
+                thumbnail_path.unlink()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid image file: {file.filename}"
+                detail=f"Invalid image file: {normalized_name}"
             )
 
         # Create database entry
         db_image = Image(
             project_id=project_id,
-            filename=file.filename,
+            filename=normalized_name,
             file_path=str(file_path),
             width=width,
             height=height,
@@ -236,7 +250,9 @@ async def upload_images(
 
         uploaded_images.append({
             "id": db_image.id,
-            "filename": file.filename,
+            "filename": normalized_name,
+            "file_path": str(file_path),
+            "thumbnail_path": str(thumbnail_path),
             "width": width,
             "height": height
         })

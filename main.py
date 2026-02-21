@@ -27,6 +27,7 @@ app.add_middleware(
 # Create necessary directories
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 Path(settings.MODELS_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.NETWORK_DIR).mkdir(parents=True, exist_ok=True)
 Path(settings.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 Path(settings.REPORTS_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -87,5 +88,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False
     )

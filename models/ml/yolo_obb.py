@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Callable, List
+from typing import Dict, Any, Optional, Callable, List, Union
 from pathlib import Path
 import torch
 import numpy as np
@@ -13,13 +13,13 @@ class YOLOOBBModel(BaseDetectionModel):
     Integrates logic from detection_backend/Train_OBB.py
     """
 
-    def __init__(self, model_type: str = "yolov8n-obb", device: int = 0):
+    def __init__(self, model_type: str = "yolov8n-obb", device: Union[int, str] = 0):
         """
         Initialize YOLO OBB model.
 
         Args:
             model_type: Model variant (yolov8n-obb, yolov8s-obb, yolov8m-obb, etc.)
-            device: GPU device ID
+            device: GPU device ID or "cpu"
         """
         # Ensure model_type has -obb suffix
         if not model_type.endswith("-obb"):
@@ -34,9 +34,10 @@ class YOLOOBBModel(BaseDetectionModel):
         Args:
             weights_path: Path to custom weights. If None, loads official pretrained.
         """
-        if weights_path is None:
-            # Load official pretrained OBB model
-            weights_path = f"{self.model_type}.pt"
+        weights_path = self.resolve_pretrained_weights(
+            default_filename=f"{self.model_type}.pt",
+            weights_path=weights_path
+        )
 
         self.model = YOLO(weights_path)
         print(f"Loaded YOLO OBB model: {weights_path} on {self.get_device_name()}")
@@ -53,7 +54,7 @@ class YOLOOBBModel(BaseDetectionModel):
         Args:
             data_yaml: Path to data.yaml
             config: Training config with keys:
-                - epochs (default: 100)
+                - epochs (default: 50)
                 - batch (default: 16)
                 - imgsz (default: 640)
                 - lr0 (default: 0.005)
@@ -74,9 +75,9 @@ class YOLOOBBModel(BaseDetectionModel):
         # Prepare training arguments (OBB-specific defaults from Train_OBB.py)
         train_args = {
             "data": data_yaml,
-            "epochs": config.get("epochs", 300),
-            "imgsz": config.get("imgsz", 768),  # OBB typically uses larger images
-            "batch": config.get("batch", 32),
+            "epochs": config.get("epochs", 50),
+            "imgsz": config.get("imgsz", 640),
+            "batch": config.get("batch", 16),
             "device": self.device,
             "lr0": config.get("lr0", 0.005),  # Lower LR for OBB
             "mosaic": config.get("mosaic", 0.5),
@@ -88,6 +89,9 @@ class YOLOOBBModel(BaseDetectionModel):
             "verbose": config.get("verbose", True),
             "optimizer": config.get("optimizer", "auto"),
             "pretrained": config.get("pretrained", True),
+            "amp": config.get("amp", True),
+            "deterministic": config.get("deterministic", False),
+            "plots": config.get("plots", False),
         }
 
         # Add callback if provided
@@ -107,7 +111,9 @@ class YOLOOBBModel(BaseDetectionModel):
                     "recall": trainer.metrics.get("metrics/recall(B)"),
                     "learning_rate": trainer.optimizer.param_groups[0]['lr'],
                 }
-                callback(trainer.epoch, metrics)
+                should_stop = callback(trainer.epoch, metrics)
+                if should_stop:
+                    trainer.stop = True
 
             self.model.add_callback("on_train_epoch_end", on_train_epoch_end)
 

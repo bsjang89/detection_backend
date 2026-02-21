@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 import shutil
 import random
+import math
 
 from models.database import Project, Image, Annotation, Class, SplitType
 from config.settings import settings
@@ -89,6 +90,28 @@ class DatasetService:
         }
 
     @staticmethod
+    def _obb_corners_from_cxcywhr(cx: float, cy: float, width: float, height: float, rotation: float) -> List[Tuple[float, float]]:
+        """
+        Convert normalized OBB (cx, cy, w, h, r) to 4 normalized corner points.
+        Returns points in clockwise order.
+        """
+        hw = width / 2.0
+        hh = height / 2.0
+        cos_r = math.cos(rotation)
+        sin_r = math.sin(rotation)
+
+        local_points = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        corners: List[Tuple[float, float]] = []
+        for dx, dy in local_points:
+            x = cx + (dx * cos_r - dy * sin_r)
+            y = cy + (dx * sin_r + dy * cos_r)
+            x = min(1.0, max(0.0, x))
+            y = min(1.0, max(0.0, y))
+            corners.append((x, y))
+
+        return corners
+
+    @staticmethod
     def generate_yolo_dataset(
         db: Session,
         project_id: int,
@@ -112,10 +135,13 @@ class DatasetService:
         dataset_path = Path(output_dir)
         dataset_path.mkdir(parents=True, exist_ok=True)
 
-        # Create directories
+        # Recreate split directories to avoid stale cache/labels from previous runs
         for split in ["train", "val", "test"]:
-            (dataset_path / split / "images").mkdir(parents=True, exist_ok=True)
-            (dataset_path / split / "labels").mkdir(parents=True, exist_ok=True)
+            split_path = dataset_path / split
+            if split_path.exists():
+                shutil.rmtree(split_path, ignore_errors=True)
+            (split_path / "images").mkdir(parents=True, exist_ok=True)
+            (split_path / "labels").mkdir(parents=True, exist_ok=True)
 
         # Get class mapping
         classes = db.query(Class).filter(Class.project_id == project_id).order_by(Class.class_id).all()
@@ -155,11 +181,15 @@ class DatasetService:
 
                         # YOLO format
                         if project.task_type.value == "obb":
-                            # OBB format: class_id cx cy w h rotation
-                            f.write(f"{class_obj.class_id} {ann.cx} {ann.cy} {ann.width} {ann.height} {ann.rotation}\n")
+                            # Ultralytics OBB format: class x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
+                            corners = DatasetService._obb_corners_from_cxcywhr(
+                                ann.cx, ann.cy, ann.width, ann.height, ann.rotation
+                            )
+                            corners_flat = " ".join(f"{x:.6f} {y:.6f}" for x, y in corners)
+                            f.write(f"{class_obj.class_id} {corners_flat}\n")
                         else:
                             # BBox format: class_id cx cy w h
-                            f.write(f"{class_obj.class_id} {ann.cx} {ann.cy} {ann.width} {ann.height}\n")
+                            f.write(f"{class_obj.class_id} {ann.cx:.6f} {ann.cy:.6f} {ann.width:.6f} {ann.height:.6f}\n")
 
         # Generate data.yaml
         data_yaml_path = dataset_path / "data.yaml"

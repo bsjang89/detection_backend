@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Callable, List
+from typing import Dict, Any, Optional, Callable, List, Union
 from pathlib import Path
 import torch
 from ultralytics import YOLO
@@ -12,13 +12,13 @@ class YOLOBBoxModel(BaseDetectionModel):
     Integrates logic from detection_backend/train.py
     """
 
-    def __init__(self, model_type: str = "yolov8n", device: int = 0):
+    def __init__(self, model_type: str = "yolov8n", device: Union[int, str] = 0):
         """
         Initialize YOLO BBox model.
 
         Args:
             model_type: Model variant (yolov8n, yolov8s, yolov8m, yolov8l, yolov8x)
-            device: GPU device ID
+            device: GPU device ID or "cpu"
         """
         super().__init__(model_type=model_type, task_type="bbox", device=device)
 
@@ -29,9 +29,10 @@ class YOLOBBoxModel(BaseDetectionModel):
         Args:
             weights_path: Path to custom weights. If None, loads official pretrained.
         """
-        if weights_path is None:
-            # Load official pretrained model
-            weights_path = f"{self.model_type}.pt"
+        weights_path = self.resolve_pretrained_weights(
+            default_filename=f"{self.model_type}.pt",
+            weights_path=weights_path
+        )
 
         self.model = YOLO(weights_path)
         print(f"Loaded YOLO BBox model: {weights_path} on {self.get_device_name()}")
@@ -48,7 +49,7 @@ class YOLOBBoxModel(BaseDetectionModel):
         Args:
             data_yaml: Path to data.yaml
             config: Training config with keys:
-                - epochs (default: 100)
+                - epochs (default: 50)
                 - batch (default: 16)
                 - imgsz (default: 640)
                 - lr0 (default: 0.01)
@@ -69,7 +70,7 @@ class YOLOBBoxModel(BaseDetectionModel):
         # Prepare training arguments
         train_args = {
             "data": data_yaml,
-            "epochs": config.get("epochs", 100),
+            "epochs": config.get("epochs", 50),
             "imgsz": config.get("imgsz", 640),
             "batch": config.get("batch", 16),
             "device": self.device,
@@ -83,6 +84,9 @@ class YOLOBBoxModel(BaseDetectionModel):
             "verbose": config.get("verbose", True),
             "optimizer": config.get("optimizer", "auto"),
             "pretrained": config.get("pretrained", True),
+            "amp": config.get("amp", True),
+            "deterministic": config.get("deterministic", False),
+            "plots": config.get("plots", False),
         }
 
         # Add callback if provided
@@ -103,7 +107,9 @@ class YOLOBBoxModel(BaseDetectionModel):
                     "recall": trainer.metrics.get("metrics/recall(B)"),
                     "learning_rate": trainer.optimizer.param_groups[0]['lr'],
                 }
-                callback(trainer.epoch, metrics)
+                should_stop = callback(trainer.epoch, metrics)
+                if should_stop:
+                    trainer.stop = True
 
             self.model.add_callback("on_train_epoch_end", on_train_epoch_end)
 

@@ -1,7 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Callable, List
+from typing import Dict, Any, Optional, Callable, List, Union
 from pathlib import Path
+import shutil
 import torch
+from ultralytics import YOLO
+from ultralytics.utils.downloads import attempt_download_asset
+
+from config.settings import settings
 
 
 class BaseDetectionModel(ABC):
@@ -10,14 +15,14 @@ class BaseDetectionModel(ABC):
     Provides a unified interface for training, inference, and model management.
     """
 
-    def __init__(self, model_type: str, task_type: str, device: int = 0):
+    def __init__(self, model_type: str, task_type: str, device: Union[int, str] = 0):
         """
         Initialize detection model.
 
         Args:
             model_type: Model architecture (e.g., 'yolov8n', 'yolov8s', 'yolov8m')
             task_type: Task type ('bbox' or 'obb')
-            device: GPU device ID
+            device: GPU device ID or "cpu"
         """
         self.model_type = model_type
         self.task_type = task_type
@@ -48,7 +53,8 @@ class BaseDetectionModel(ABC):
             data_yaml: Path to YOLO data.yaml file
             config: Training configuration (epochs, batch, imgsz, lr0, etc.)
             callback: Optional callback function called after each epoch
-                      Signature: callback(epoch: int, metrics: dict)
+                      Signature: callback(epoch: int, metrics: dict) -> bool
+                      Return True to request early stop.
 
         Returns:
             Dictionary containing training results and metrics
@@ -101,7 +107,7 @@ class BaseDetectionModel(ABC):
 
     def get_device_name(self) -> str:
         """Get the name of the device being used"""
-        if torch.cuda.is_available() and self.device >= 0:
+        if isinstance(self.device, int) and torch.cuda.is_available() and self.device >= 0:
             return f"cuda:{self.device} ({torch.cuda.get_device_name(self.device)})"
         return "cpu"
 
@@ -112,7 +118,7 @@ class BaseDetectionModel(ABC):
         Returns:
             Dictionary with 'used_gb' and 'total_gb'
         """
-        if torch.cuda.is_available() and self.device >= 0:
+        if isinstance(self.device, int) and torch.cuda.is_available() and self.device >= 0:
             torch.cuda.set_device(self.device)
             total = torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3)
             allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
@@ -122,3 +128,39 @@ class BaseDetectionModel(ABC):
                 "free_gb": round(total - allocated, 2)
             }
         return {"used_gb": 0, "total_gb": 0, "free_gb": 0}
+
+    def resolve_pretrained_weights(self, default_filename: str, weights_path: Optional[str] = None) -> str:
+        """
+        Resolve pretrained weights path.
+
+        If `weights_path` is provided, use it directly.
+        Otherwise, keep pretrained files under settings.NETWORK_DIR and download there if missing.
+        """
+        if weights_path:
+            return str(weights_path)
+
+        network_dir = Path(settings.NETWORK_DIR)
+        network_dir.mkdir(parents=True, exist_ok=True)
+
+        target = network_dir / default_filename
+        if target.exists():
+            return str(target)
+
+        downloaded = attempt_download_asset(str(target))
+        downloaded_path = Path(downloaded)
+        if downloaded_path.exists():
+            return str(downloaded_path)
+
+        # Fallback: let Ultralytics resolve built-in model name, then copy into network folder.
+        fallback_name = default_filename
+        try:
+            probe = YOLO(fallback_name)
+            ckpt_path = Path(getattr(probe, "ckpt_path", fallback_name))
+            if ckpt_path.exists():
+                if ckpt_path.resolve() != target.resolve():
+                    shutil.copy2(ckpt_path, target)
+                return str(target if target.exists() else ckpt_path)
+        except Exception:
+            pass
+
+        return str(target if target.exists() else fallback_name)

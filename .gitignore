@@ -1,2 +1,6 @@
 trained_models
 uploads
+.venv
+runs
+network/*.pt
+!network/.gitkeep

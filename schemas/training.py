@@ -7,7 +7,7 @@ from models.database.training_session import TrainingStatus
 class TrainingConfigSchema(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    epochs: int = Field(default=100, ge=1, le=1000)
+    epochs: int = Field(default=50, ge=1, le=1000)
     batch: int = Field(default=16, ge=1, le=128)
     imgsz: int = Field(default=640, ge=320, le=1280)
     lr0: float = Field(default=0.01, gt=0)

@@ -12,6 +12,10 @@ from schemas import (
 from models.database import TrainingMetricsLog
 from services.training_service import TrainingService
 from services.dataset_service import DatasetService
+from api.v1.websocket import (
+    broadcast_training_update_sync,
+    broadcast_status_update_sync,
+)
 
 router = APIRouter()
 
@@ -52,9 +56,22 @@ def start_training(
 ):
     """Start training for a session"""
     try:
+        def on_epoch_callback(training_session_id: int, epoch: int, metrics: dict):
+            broadcast_training_update_sync(
+                training_session_id=training_session_id,
+                epoch=epoch,
+                metrics=metrics,
+            )
+
         result = TrainingService.start_training(
             db=db,
-            training_session_id=session_id
+            training_session_id=session_id,
+            on_epoch_callback=on_epoch_callback,
+        )
+        broadcast_status_update_sync(
+            training_session_id=session_id,
+            status="running",
+            message="Training started",
         )
         return result
     except ValueError as e:
@@ -80,11 +97,44 @@ def stop_training(
             db=db,
             training_session_id=session_id
         )
+        broadcast_status_update_sync(
+            training_session_id=session_id,
+            status="stopped",
+            message="Training stopped",
+        )
         return result
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
+        )
+
+
+@router.delete("/sessions/{session_id}")
+def delete_training_session(
+    session_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete a training session"""
+    try:
+        return TrainingService.delete_training_session(
+            db=db,
+            training_session_id=session_id
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete training session: {str(e)}"
         )
 
 
