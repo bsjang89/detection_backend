@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List
+from typing import List, Literal, Set
 import shutil
 from pathlib import Path
 from PIL import Image as PILImage
@@ -20,6 +20,20 @@ from schemas import (
 )
 
 router = APIRouter()
+
+
+def _resolve_duplicate_filename(filename: str, used_names: Set[str]) -> str:
+    """
+    Resolve duplicate filename using suffix pattern: name(1).ext, name(2).ext, ...
+    """
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    idx = 1
+    candidate = filename
+    while candidate in used_names:
+        candidate = f"{stem}({idx}){suffix}"
+        idx += 1
+    return candidate
 
 
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -190,6 +204,7 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 async def upload_images(
     project_id: int,
     files: List[UploadFile] = File(...),
+    duplicate_mode: Literal["skip", "rename"] = Query(default="rename"),
     db: Session = Depends(get_db)
 ):
     """Upload multiple images to a project"""
@@ -204,6 +219,9 @@ async def upload_images(
     project_images_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded_images = []
+    existing_names = {
+        row[0] for row in db.query(Image.filename).filter(Image.project_id == project_id).all()
+    }
 
     for file in files:
         normalized_name = safe_filename(file.filename or "")
@@ -213,8 +231,26 @@ async def upload_images(
                 detail="Invalid image filename"
             )
 
-        file_path = project_images_dir / normalized_name
-        thumbnail_path = get_thumbnail_path(project_id, normalized_name)
+        target_name = normalized_name
+        renamed_from = None
+
+        # Handle duplicate filename policy
+        if target_name in existing_names or (project_images_dir / target_name).exists():
+            if duplicate_mode == "skip":
+                uploaded_images.append({
+                    "id": None,
+                    "filename": normalized_name,
+                    "status": "skipped",
+                    "reason": "duplicate",
+                    "renamed_from": None,
+                })
+                continue
+
+            target_name = _resolve_duplicate_filename(target_name, existing_names)
+            renamed_from = normalized_name
+
+        file_path = project_images_dir / target_name
+        thumbnail_path = get_thumbnail_path(project_id, target_name)
 
         # Save original file
         with open(file_path, "wb") as buffer:
@@ -232,13 +268,13 @@ async def upload_images(
                 thumbnail_path.unlink()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid image file: {normalized_name}"
+                detail=f"Invalid image file: {target_name}"
             )
 
         # Create database entry
         db_image = Image(
             project_id=project_id,
-            filename=normalized_name,
+            filename=target_name,
             file_path=str(file_path),
             width=width,
             height=height,
@@ -250,12 +286,16 @@ async def upload_images(
 
         uploaded_images.append({
             "id": db_image.id,
-            "filename": normalized_name,
+            "filename": target_name,
             "file_path": str(file_path),
             "thumbnail_path": str(thumbnail_path),
             "width": width,
-            "height": height
+            "height": height,
+            "status": "uploaded",
+            "reason": None,
+            "renamed_from": renamed_from,
         })
+        existing_names.add(target_name)
 
     return uploaded_images
 

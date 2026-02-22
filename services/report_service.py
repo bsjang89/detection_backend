@@ -100,19 +100,19 @@ class ReportService:
                     <div class="stat-label">Task Type</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-value">{{ "%.1f"|format(map50 * 100) if map50 else "N/A" }}%</div>
+                    <div class="stat-value">{{ "%.1f"|format(map50 * 100) if map50 is not none else "N/A" }}%</div>
                     <div class="stat-label">mAP50</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-value">{{ "%.1f"|format(map50_95 * 100) if map50_95 else "N/A" }}%</div>
+                    <div class="stat-value">{{ "%.1f"|format(map50_95 * 100) if map50_95 is not none else "N/A" }}%</div>
                     <div class="stat-label">mAP50-95</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-value">{{ "%.1f"|format(precision * 100) if precision else "N/A" }}%</div>
+                    <div class="stat-value">{{ "%.1f"|format(precision * 100) if precision is not none else "N/A" }}%</div>
                     <div class="stat-label">Precision</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-value">{{ "%.1f"|format(recall * 100) if recall else "N/A" }}%</div>
+                    <div class="stat-value">{{ "%.1f"|format(recall * 100) if recall is not none else "N/A" }}%</div>
                     <div class="stat-label">Recall</div>
                 </div>
             </div>
@@ -155,14 +155,14 @@ class ReportService:
                     {% for m in metrics_data %}
                     <tr>
                         <td>{{ m.epoch }}</td>
-                        <td>{{ "%.4f"|format(m.train_box_loss) if m.train_box_loss else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.train_cls_loss) if m.train_cls_loss else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.val_box_loss) if m.val_box_loss else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.val_cls_loss) if m.val_cls_loss else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.map50) if m.map50 else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.map50_95) if m.map50_95 else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.precision) if m.precision else "-" }}</td>
-                        <td>{{ "%.4f"|format(m.recall) if m.recall else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.train_box_loss) if m.train_box_loss is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.train_cls_loss) if m.train_cls_loss is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.val_box_loss) if m.val_box_loss is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.val_cls_loss) if m.val_cls_loss is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.map50) if m.map50 is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.map50_95) if m.map50_95 is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.precision) if m.precision is not none else "-" }}</td>
+                        <td>{{ "%.4f"|format(m.recall) if m.recall is not none else "-" }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -178,7 +178,7 @@ class ReportService:
                 {% for result in inference_results %}
                 <div class="result-card">
                     {% if result.result_image_path %}
-                    <img src="file:///{{ result.result_image_path }}" alt="{{ result.filename }}">
+                    <img src="{{ result.result_image_path }}" alt="{{ result.filename }}">
                     {% endif %}
                     <div class="info">
                         <strong>{{ result.filename }}</strong><br>
@@ -288,11 +288,17 @@ class ReportService:
 
         for r in results:
             image = db.query(Image).filter(Image.id == r.image_id).first()
+            report_image_uri = None
+            if r.result_image_path:
+                try:
+                    report_image_uri = Path(r.result_image_path).resolve().as_uri()
+                except Exception:
+                    report_image_uri = r.result_image_path
             inference_results.append({
                 "filename": image.filename if image else "unknown",
                 "detection_count": len(r.detections) if r.detections else 0,
                 "inference_time_ms": r.inference_time_ms or 0,
-                "result_image_path": r.result_image_path,
+                "result_image_path": report_image_uri,
             })
 
         # Get class distribution
@@ -301,13 +307,13 @@ class ReportService:
             from sqlalchemy import func
             from models.database import Annotation
             classes = db.query(Class).filter(Class.project_id == project.id).order_by(Class.class_id).all()
-            for cls in classes:
+            for class_row in classes:
                 count = db.query(func.count(Annotation.id)).filter(
-                    Annotation.class_id == cls.id
+                    Annotation.class_id == class_row.id
                 ).scalar() or 0
                 class_distribution.append({
-                    "class_id": cls.class_id,
-                    "class_name": cls.class_name,
+                    "class_id": class_row.class_id,
+                    "class_name": class_row.class_name,
                     "count": count,
                 })
 

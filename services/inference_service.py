@@ -1,10 +1,13 @@
 from sqlalchemy.orm import Session
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import cv2
 import numpy as np
 from shapely.geometry import Polygon
 import time
+import torch
 
 from models.database import Model, Image, InferenceResult
 from models.ml import ModelRegistry
@@ -21,10 +24,22 @@ class InferenceService:
 
     # Model cache: model_id -> (model_instance, last_used_time)
     _model_cache: Dict[int, Tuple[Any, float]] = {}
+    _cache_lock = threading.RLock()
     _cache_max_size = 3
+    _result_box_thickness = 4
+    _result_text_scale_bbox = 0.5
+    _result_text_scale_obb = 0.6
+    _result_text_thickness = 2
+    _result_jpeg_quality = 75
+    _result_review_size = 512
 
     @classmethod
-    def _load_model(cls, model_id: int, db: Session):
+    def _load_model(
+        cls,
+        model_id: int,
+        db: Session,
+        model_record: Optional[Model] = None
+    ):
         """
         Load model from cache or disk.
 
@@ -35,14 +50,16 @@ class InferenceService:
         Returns:
             Model instance
         """
-        # Check cache
-        if model_id in cls._model_cache:
-            model_instance, _ = cls._model_cache[model_id]
-            cls._model_cache[model_id] = (model_instance, time.time())
-            return model_instance
+        # Check cache first
+        with cls._cache_lock:
+            if model_id in cls._model_cache:
+                model_instance, _ = cls._model_cache[model_id]
+                cls._model_cache[model_id] = (model_instance, time.time())
+                return model_instance
 
         # Load from database
-        model_record = db.query(Model).filter(Model.id == model_id).first()
+        if model_record is None:
+            model_record = db.query(Model).filter(Model.id == model_id).first()
         if not model_record:
             raise ValueError(f"Model {model_id} not found")
 
@@ -50,22 +67,57 @@ class InferenceService:
         model_instance = ModelRegistry.create_model(
             task_type=model_record.task_type,
             model_type=model_record.model_type,
-            device=GPUManager.get_inference_gpu()
+            device=GPUManager.get_inference_device()
         )
 
         # Load weights
         model_instance.load_model(model_record.weights_path)
 
         # Add to cache
-        cls._model_cache[model_id] = (model_instance, time.time())
+        with cls._cache_lock:
+            cls._model_cache[model_id] = (model_instance, time.time())
 
-        # Clean cache if too large
-        if len(cls._model_cache) > cls._cache_max_size:
-            # Remove oldest
-            oldest_id = min(cls._model_cache.keys(), key=lambda k: cls._model_cache[k][1])
-            del cls._model_cache[oldest_id]
+            # Clean cache if too large
+            while len(cls._model_cache) > cls._cache_max_size:
+                oldest_id = min(cls._model_cache.keys(), key=lambda k: cls._model_cache[k][1])
+                del cls._model_cache[oldest_id]
 
         return model_instance
+
+    @classmethod
+    def _preload_models_parallel(cls, db: Session, model_ids: List[int]) -> None:
+        """
+        Preload models concurrently into cache to reduce compare startup latency.
+        Inference execution remains sequential on the inference device.
+        """
+        unique_ids = list(dict.fromkeys(model_ids))
+        if not unique_ids:
+            return
+
+        records = db.query(Model).filter(Model.id.in_(unique_ids)).all()
+        record_map = {m.id: m for m in records}
+        missing = [mid for mid in unique_ids if mid not in record_map]
+        if missing:
+            raise ValueError(f"Model(s) not found: {missing}")
+
+        with cls._cache_lock:
+            to_load = [mid for mid in unique_ids if mid not in cls._model_cache]
+            for mid in unique_ids:
+                if mid in cls._model_cache:
+                    model_instance, _ = cls._model_cache[mid]
+                    cls._model_cache[mid] = (model_instance, time.time())
+
+        if not to_load:
+            return
+
+        workers = min(2, len(to_load))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(cls._load_model, mid, db, record_map[mid])
+                for mid in to_load
+            ]
+            for f in futures:
+                f.result()
 
     @classmethod
     def predict_single(
@@ -75,7 +127,8 @@ class InferenceService:
         image_id: int,
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.7,
-        save_result_image: bool = True
+        save_result_image: bool = True,
+        save_to_db: bool = True
     ) -> Dict[str, Any]:
         """
         Run inference on a single image.
@@ -87,6 +140,7 @@ class InferenceService:
             conf_threshold: Confidence threshold
             iou_threshold: IOU threshold for NMS
             save_result_image: Whether to save result image with drawn detections
+            save_to_db: Whether to persist inference result row
 
         Returns:
             Inference results dictionary
@@ -133,28 +187,220 @@ class InferenceService:
                     filename=f"{image_record.id}_{Path(image_record.filename).stem}.jpg"
                 )
 
-        # Save inference result to database
-        inference_result = InferenceResult(
-            model_id=model_id,
-            image_id=image_id,
-            detections=detections,
-            result_image_path=result_image_path,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            inference_time_ms=inference_time_ms
-        )
+        inference_result_id = None
+        if save_to_db:
+            # Save inference result to database
+            inference_result = InferenceResult(
+                model_id=model_id,
+                image_id=image_id,
+                detections=detections,
+                result_image_path=result_image_path,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
+                inference_time_ms=inference_time_ms
+            )
 
-        db.add(inference_result)
-        db.commit()
-        db.refresh(inference_result)
+            db.add(inference_result)
+            db.commit()
+            db.refresh(inference_result)
+            inference_result_id = inference_result.id
 
         return {
-            "inference_result_id": inference_result.id,
+            "inference_result_id": inference_result_id,
             "detections": detections,
             "result_image_path": result_image_path,
             "inference_time_ms": inference_time_ms,
             "detection_count": len(detections)
         }
+
+    @staticmethod
+    def _extract_detections_from_result(task_type: str, result: Any) -> List[Dict[str, Any]]:
+        """Extract normalized detection payload from a single Ultralytics result."""
+        detections: List[Dict[str, Any]] = []
+
+        if task_type == "obb":
+            if hasattr(result, "obb") and result.obb is not None:
+                obbs = result.obb
+                for i in range(len(obbs)):
+                    detections.append({
+                        "class_id": int(obbs.cls[i]),
+                        "confidence": float(obbs.conf[i]),
+                        "obb": obbs.xyxyxyxy[i].cpu().numpy().flatten().tolist(),
+                    })
+            return detections
+
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return detections
+
+        for i in range(len(boxes)):
+            detections.append({
+                "class_id": int(boxes.cls[i]),
+                "confidence": float(boxes.conf[i]),
+                "bbox": boxes.xyxy[i].cpu().numpy().tolist(),
+            })
+        return detections
+
+    @classmethod
+    def predict_batch(
+        cls,
+        db: Session,
+        model_id: int,
+        image_ids: List[int],
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.7,
+        batch_size: int = 10,
+        save_result_image: bool = False,
+        save_to_db: bool = False,
+        ordered_images: Optional[List[Image]] = None,
+        source_inputs: Optional[List[Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Run inference on multiple images in one batched call.
+        """
+        if not image_ids:
+            return []
+
+        GPUManager.validate_inference_gpu()
+
+        model_record = db.query(Model).filter(Model.id == model_id).first()
+        if not model_record:
+            raise ValueError(f"Model {model_id} not found")
+
+        if ordered_images is None:
+            image_records = db.query(Image).filter(Image.id.in_(image_ids)).all()
+            image_map = {img.id: img for img in image_records}
+            missing_ids = [img_id for img_id in image_ids if img_id not in image_map]
+            if missing_ids:
+                raise ValueError(f"Images not found: {missing_ids}")
+            ordered_images = [image_map[img_id] for img_id in image_ids]
+        else:
+            provided_map = {img.id: img for img in ordered_images}
+            missing_ids = [img_id for img_id in image_ids if img_id not in provided_map]
+            if missing_ids:
+                raise ValueError(f"Images not found: {missing_ids}")
+            ordered_images = [provided_map[img_id] for img_id in image_ids]
+
+        predict_source: List[Any]
+        if source_inputs is not None:
+            if len(source_inputs) != len(ordered_images):
+                raise ValueError(
+                    f"source_inputs length mismatch: expected {len(ordered_images)}, got {len(source_inputs)}"
+                )
+            predict_source = source_inputs
+        else:
+            # Decode once per request/chunk to reduce file-loader overhead in Ultralytics.
+            predict_source = []
+            for image_record in ordered_images:
+                src = cv2.imread(image_record.file_path)
+                if src is None:
+                    raise ValueError(f"Failed to read image: {image_record.file_path}")
+                predict_source.append(src)
+        model = cls._load_model(model_id, db)
+
+        raw_results = model.model.predict(
+            source=predict_source,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            device=model.device,
+            batch=batch_size,
+            half=(torch.cuda.is_available() and model.device != "cpu"),
+            verbose=False
+        )
+        raw_results = list(raw_results)
+
+        if len(raw_results) != len(ordered_images):
+            raise RuntimeError(
+                f"Batch inference output mismatch: expected {len(ordered_images)}, got {len(raw_results)}"
+            )
+
+        response_rows: List[Dict[str, Any]] = []
+        db_rows: List[InferenceResult] = []
+        draw_tasks: List[Tuple[int, Any]] = []
+
+        for image_record, raw_result in zip(ordered_images, raw_results):
+            detections = cls._extract_detections_from_result(model_record.task_type, raw_result)
+
+            speed = getattr(raw_result, "speed", {}) or {}
+            inference_time_ms = float(
+                speed.get("preprocess", 0.0) + speed.get("inference", 0.0) + speed.get("postprocess", 0.0)
+            )
+
+            result_image_path = None
+
+            row = {
+                "image_id": image_record.id,
+                "inference_result_id": None,
+                "detections": detections,
+                "result_image_path": result_image_path,
+                "inference_time_ms": inference_time_ms,
+                "detection_count": len(detections),
+            }
+            response_rows.append(row)
+
+            if save_result_image:
+                source_img = getattr(raw_result, "orig_img", None)
+                if model_record.task_type == "obb":
+                    draw_tasks.append((
+                        len(response_rows) - 1,
+                        (
+                            cls._draw_obb_detections,
+                            {
+                                "image_path": image_record.file_path,
+                                "detections": detections,
+                                "output_dir": Path(settings.RESULTS_DIR) / "inference" / str(model_id),
+                                "filename": f"{image_record.id}_{Path(image_record.filename).stem}.jpg",
+                                "conf_threshold": conf_threshold,
+                                "overlap_iou": None,
+                                "image_array": source_img,
+                            },
+                        ),
+                    ))
+                else:
+                    draw_tasks.append((
+                        len(response_rows) - 1,
+                        (
+                            cls._draw_bbox_detections,
+                            {
+                                "image_path": image_record.file_path,
+                                "detections": detections,
+                                "output_dir": Path(settings.RESULTS_DIR) / "inference" / str(model_id),
+                                "filename": f"{image_record.id}_{Path(image_record.filename).stem}.jpg",
+                                "image_array": source_img,
+                            },
+                        ),
+                    ))
+
+            if save_to_db:
+                db_rows.append(
+                    InferenceResult(
+                        model_id=model_id,
+                        image_id=image_record.id,
+                        detections=detections,
+                        result_image_path=result_image_path,
+                        conf_threshold=conf_threshold,
+                        iou_threshold=iou_threshold,
+                        inference_time_ms=inference_time_ms
+                    )
+                )
+
+        if draw_tasks:
+            workers = min(4, len(draw_tasks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures: List[Tuple[int, Any]] = []
+                for row_index, (draw_fn, kwargs) in draw_tasks:
+                    futures.append((row_index, pool.submit(draw_fn, **kwargs)))
+                for row_index, future in futures:
+                    response_rows[row_index]["result_image_path"] = future.result()
+
+        if save_to_db and db_rows:
+            db.add_all(db_rows)
+            db.commit()
+            for saved_row, response_row in zip(db_rows, response_rows):
+                db.refresh(saved_row)
+                response_row["inference_result_id"] = saved_row.id
+
+        return response_rows
 
     @classmethod
     def compare_models(
@@ -180,6 +426,8 @@ class InferenceService:
         Returns:
             Comparison results
         """
+        cls._preload_models_parallel(db, [model_id_1, model_id_2])
+
         result1 = cls.predict_single(
             db=db,
             model_id=model_id_1,
@@ -216,12 +464,201 @@ class InferenceService:
         }
 
     @classmethod
+    def compare_models_batch(
+        cls,
+        db: Session,
+        model_id_1: int,
+        model_id_2: int,
+        image_ids: List[int],
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.7,
+        batch_size: int = 10,
+        save_result_image: bool = False,
+        save_to_db: bool = False,
+        include_detections: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Compare two models across multiple images.
+        """
+        model_1_record = db.query(Model).filter(Model.id == model_id_1).first()
+        if not model_1_record:
+            raise ValueError(f"Model {model_id_1} not found")
+        model_2_record = db.query(Model).filter(Model.id == model_id_2).first()
+        if not model_2_record:
+            raise ValueError(f"Model {model_id_2} not found")
+
+        image_records = db.query(Image).filter(Image.id.in_(image_ids)).all()
+        image_map = {img.id: img for img in image_records}
+        missing_ids = [img_id for img_id in image_ids if img_id not in image_map]
+        if missing_ids:
+            raise ValueError(f"Images not found: {missing_ids}")
+        ordered_images = [image_map[img_id] for img_id in image_ids]
+
+        # Decode source images once and share for both model runs.
+        source_images: List[np.ndarray] = []
+        for image_record in ordered_images:
+            src = cv2.imread(image_record.file_path)
+            if src is None:
+                raise ValueError(f"Failed to read image: {image_record.file_path}")
+            source_images.append(src)
+
+        cls._preload_models_parallel(db, [model_id_1, model_id_2])
+
+        # Fast path:
+        # keep GPU busy with model-B inference while model-A result rendering happens on CPU threads.
+        # DB persistence path remains on the existing synchronous flow for consistency.
+        if save_result_image and not save_to_db:
+            workers = max(1, min(4, len(ordered_images)))
+            with ThreadPoolExecutor(max_workers=workers) as draw_pool:
+                model_1_results = cls.predict_batch(
+                    db=db,
+                    model_id=model_id_1,
+                    image_ids=image_ids,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    batch_size=batch_size,
+                    save_result_image=False,
+                    save_to_db=False,
+                    ordered_images=ordered_images,
+                    source_inputs=source_images,
+                )
+                model_1_draw_jobs = cls._schedule_result_image_draws(
+                    pool=draw_pool,
+                    model_id=model_id_1,
+                    task_type=model_1_record.task_type,
+                    ordered_images=ordered_images,
+                    source_images=source_images,
+                    rows=model_1_results,
+                    conf_threshold=conf_threshold,
+                )
+
+                model_2_results = cls.predict_batch(
+                    db=db,
+                    model_id=model_id_2,
+                    image_ids=image_ids,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    batch_size=batch_size,
+                    save_result_image=False,
+                    save_to_db=False,
+                    ordered_images=ordered_images,
+                    source_inputs=source_images,
+                )
+                model_2_draw_jobs = cls._schedule_result_image_draws(
+                    pool=draw_pool,
+                    model_id=model_id_2,
+                    task_type=model_2_record.task_type,
+                    ordered_images=ordered_images,
+                    source_images=source_images,
+                    rows=model_2_results,
+                    conf_threshold=conf_threshold,
+                )
+
+                cls._resolve_result_image_draws(model_1_results, model_1_draw_jobs)
+                cls._resolve_result_image_draws(model_2_results, model_2_draw_jobs)
+        else:
+            model_1_results = cls.predict_batch(
+                db=db,
+                model_id=model_id_1,
+                image_ids=image_ids,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
+                batch_size=batch_size,
+                save_result_image=save_result_image,
+                save_to_db=save_to_db,
+                ordered_images=ordered_images,
+                source_inputs=source_images,
+            )
+            model_2_results = cls.predict_batch(
+                db=db,
+                model_id=model_id_2,
+                image_ids=image_ids,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
+                batch_size=batch_size,
+                save_result_image=save_result_image,
+                save_to_db=save_to_db,
+                ordered_images=ordered_images,
+                source_inputs=source_images,
+            )
+
+        joined_results = []
+        for m1, m2 in zip(model_1_results, model_2_results):
+            joined_results.append({
+                "image_id": m1["image_id"],
+                "model_1": {
+                    "model_id": model_id_1,
+                    "inference_result_id": m1["inference_result_id"],
+                    "detections": m1["detections"] if include_detections else [],
+                    "result_image_path": m1["result_image_path"],
+                    "inference_time_ms": m1["inference_time_ms"],
+                    "detection_count": m1["detection_count"],
+                },
+                "model_2": {
+                    "model_id": model_id_2,
+                    "inference_result_id": m2["inference_result_id"],
+                    "detections": m2["detections"] if include_detections else [],
+                    "result_image_path": m2["result_image_path"],
+                    "inference_time_ms": m2["inference_time_ms"],
+                    "detection_count": m2["detection_count"],
+                }
+            })
+
+        return {"results": joined_results}
+
+    @classmethod
+    def _schedule_result_image_draws(
+        cls,
+        pool: ThreadPoolExecutor,
+        model_id: int,
+        task_type: str,
+        ordered_images: List[Image],
+        source_images: List[np.ndarray],
+        rows: List[Dict[str, Any]],
+        conf_threshold: float
+    ) -> List[Tuple[int, Any]]:
+        jobs: List[Tuple[int, Any]] = []
+        output_dir = Path(settings.RESULTS_DIR) / "inference" / str(model_id)
+
+        for idx, (image_record, source_img, row) in enumerate(zip(ordered_images, source_images, rows)):
+            filename = f"{image_record.id}_{Path(image_record.filename).stem}.jpg"
+            if task_type == "obb":
+                future = pool.submit(
+                    cls._draw_obb_detections,
+                    image_path=image_record.file_path,
+                    detections=row["detections"],
+                    output_dir=output_dir,
+                    filename=filename,
+                    conf_threshold=conf_threshold,
+                    overlap_iou=None,
+                    image_array=source_img,
+                )
+            else:
+                future = pool.submit(
+                    cls._draw_bbox_detections,
+                    image_path=image_record.file_path,
+                    detections=row["detections"],
+                    output_dir=output_dir,
+                    filename=filename,
+                    image_array=source_img,
+                )
+            jobs.append((idx, future))
+
+        return jobs
+
+    @staticmethod
+    def _resolve_result_image_draws(rows: List[Dict[str, Any]], jobs: List[Tuple[int, Any]]) -> None:
+        for row_idx, future in jobs:
+            rows[row_idx]["result_image_path"] = future.result()
+
+    @classmethod
     def _draw_bbox_detections(
         cls,
         image_path: str,
         detections: List[Dict],
         output_dir: Path,
-        filename: str
+        filename: str,
+        image_array: Optional[np.ndarray] = None
     ) -> str:
         """
         Draw bounding box detections on image.
@@ -238,26 +675,55 @@ class InferenceService:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / filename
 
-        # Read image
-        img = cv2.imread(image_path)
+        # Use provided image to avoid disk re-read when available.
+        if image_array is not None:
+            img = image_array.copy()
+        else:
+            img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Failed to read image: {image_path}")
+
+        # Render on review canvas first to avoid text/box quality loss from post-resize.
+        img, scale, pad_x, pad_y = cls._resize_to_square_review_with_transform(
+            img, cls._result_review_size
+        )
+        h, w = img.shape[:2]
 
         # Draw each detection
         for det in detections:
             bbox = det["bbox"]  # [x1, y1, x2, y2]
-            x1, y1, x2, y2 = map(int, bbox)
+            x1 = int(round(float(bbox[0]) * scale + pad_x))
+            y1 = int(round(float(bbox[1]) * scale + pad_y))
+            x2 = int(round(float(bbox[2]) * scale + pad_x))
+            y2 = int(round(float(bbox[3]) * scale + pad_y))
+            x1, x2 = sorted((x1, x2))
+            y1, y2 = sorted((y1, y2))
+            x1 = max(0, min(w - 1, x1))
+            x2 = max(0, min(w - 1, x2))
+            y1 = max(0, min(h - 1, y1))
+            y2 = max(0, min(h - 1, y2))
             conf = det["confidence"]
             class_id = det["class_id"]
 
             # Draw rectangle
             color = cls._get_class_color(class_id)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, cls._result_box_thickness)
 
             # Draw label
             label = f"Class {class_id}: {conf:.2f}"
-            cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            text_y = max(50, y1 - 20)
+            cv2.putText(
+                img,
+                label,
+                (max(10, x1), text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                cls._result_text_scale_bbox,
+                color,
+                cls._result_text_thickness,
+                cv2.LINE_AA
+            )
 
-        # Save
-        cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
 
         return str(output_path)
 
@@ -269,11 +735,12 @@ class InferenceService:
         output_dir: Path,
         filename: str,
         conf_threshold: float = 0.25,
-        overlap_iou: float = 0.5
+        overlap_iou: Optional[float] = None,
+        image_array: Optional[np.ndarray] = None
     ) -> str:
         """
-        Draw OBB detections on image with custom NMS.
-        Integrates logic from Test_Otoki.py
+        Draw OBB detections on image.
+        Uses optional custom polygon-NMS when overlap_iou is provided.
 
         Args:
             image_path: Path to input image
@@ -281,7 +748,7 @@ class InferenceService:
             output_dir: Output directory
             filename: Output filename
             conf_threshold: Confidence threshold for drawing
-            overlap_iou: IOU threshold for custom NMS
+            overlap_iou: IOU threshold for custom NMS (None disables extra suppression)
 
         Returns:
             Path to result image
@@ -289,11 +756,22 @@ class InferenceService:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / filename
 
-        # Read image
-        img = cv2.imread(image_path)
+        # Use provided image to avoid disk re-read when available.
+        if image_array is not None:
+            img = image_array.copy()
+        else:
+            img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Failed to read image: {image_path}")
+
+        # Render on review canvas first to avoid text/box quality loss from post-resize.
+        img, scale, pad_x, pad_y = cls._resize_to_square_review_with_transform(
+            img, cls._result_review_size
+        )
+        h, w = img.shape[:2]
 
         if not detections:
-            cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
             return str(output_path)
 
         # Convert to arrays for NMS
@@ -319,15 +797,22 @@ class InferenceService:
         class_ids = class_ids[valid]
 
         if len(polys) == 0:
-            cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
             return str(output_path)
 
-        # Custom NMS for OBB
-        keep_idxs = cls._suppress_obb(polys, confs, iou_th=overlap_iou)
+        if overlap_iou is not None and overlap_iou > 0:
+            keep_idxs = cls._suppress_obb(polys, confs, iou_th=overlap_iou)
+        else:
+            keep_idxs = list(range(len(polys)))
 
         # Draw
         for i in keep_idxs:
-            pts = polys[i].astype(int)
+            pts = polys[i].copy()
+            pts[:, 0] = pts[:, 0] * scale + pad_x
+            pts[:, 1] = pts[:, 1] * scale + pad_y
+            pts = np.round(pts).astype(int)
+            pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
             cls_id = int(class_ids[i])
             conf = float(confs[i])
 
@@ -335,18 +820,59 @@ class InferenceService:
             label = f"Class {cls_id}: {conf:.2f}"
 
             # Draw polygon
-            cv2.polylines(img, [pts], True, color, 4)
+            cv2.polylines(img, [pts], True, color, cls._result_box_thickness)
 
             # Draw label at center
             cx = int(pts[:, 0].mean())
             cy = int(pts[:, 1].mean())
             cv2.putText(
-                img, label, (cx - 40, cy - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA
+                img,
+                label,
+                (max(10, cx - 120), max(50, cy - 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                cls._result_text_scale_obb,
+                color,
+                cls._result_text_thickness,
+                cv2.LINE_AA
             )
 
-        cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
         return str(output_path)
+
+    @classmethod
+    def _resize_to_square_review_with_transform(
+        cls,
+        img: np.ndarray,
+        target: int = 512
+    ) -> Tuple[np.ndarray, float, int, int]:
+        """
+        Resize image to a square review frame while preserving aspect ratio.
+        Returns resized canvas and transform values used for coordinate mapping.
+        """
+        if img is None or img.size == 0:
+            return img, 1.0, 0, 0
+
+        h, w = img.shape[:2]
+        if h <= 0 or w <= 0:
+            return img, 1.0, 0, 0
+
+        scale = min(target / float(w), target / float(h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+        canvas = np.zeros((target, target, 3), dtype=np.uint8)
+        x = (target - new_w) // 2
+        y = (target - new_h) // 2
+        canvas[y:y + new_h, x:x + new_w] = resized
+        return canvas, scale, x, y
+
+    @classmethod
+    def _resize_to_square_review(cls, img: np.ndarray, target: int = 512) -> np.ndarray:
+        """Backwards-compatible helper returning only review canvas image."""
+        canvas, _, _, _ = cls._resize_to_square_review_with_transform(img, target)
+        return canvas
 
     @staticmethod
     def _polygon_iou(p1: np.ndarray, p2: np.ndarray) -> float:

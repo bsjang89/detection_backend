@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # GPU Management
     TRAINING_GPU_ID: int = 0
-    INFERENCE_GPU_ID: int = 1
+    INFERENCE_GPU_ID: int = 0
 
     # File Storage
     UPLOAD_DIR: str = "uploads"

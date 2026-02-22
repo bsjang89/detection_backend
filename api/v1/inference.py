@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional
+from typing import List
 
 from config.database import get_db
 from models.database import Model, Image
@@ -20,6 +20,7 @@ class InferenceRequest(BaseModel):
     conf_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
     iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     save_result_image: bool = True
+    save_to_db: bool = True
 
 
 class CompareRequest(BaseModel):
@@ -30,6 +31,32 @@ class CompareRequest(BaseModel):
     image_id: int
     conf_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
     iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+class InferenceBatchRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: int
+    image_ids: List[int] = Field(min_length=1)
+    conf_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    batch_size: int = Field(default=10, ge=1, le=64)
+    save_result_image: bool = False
+    save_to_db: bool = False
+
+
+class CompareBatchRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id_1: int
+    model_id_2: int
+    image_ids: List[int] = Field(min_length=1)
+    conf_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    batch_size: int = Field(default=10, ge=1, le=64)
+    save_result_image: bool = False
+    save_to_db: bool = False
+    include_detections: bool = False
 
 
 @router.post("/predict")
@@ -69,7 +96,8 @@ def predict(
             image_id=request.image_id,
             conf_threshold=request.conf_threshold,
             iou_threshold=request.iou_threshold,
-            save_result_image=request.save_result_image
+            save_result_image=request.save_result_image,
+            save_to_db=request.save_to_db,
         )
         return result
 
@@ -77,6 +105,43 @@ def predict(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inference failed: {str(e)}"
+        )
+
+
+@router.post("/predict/batch")
+def predict_batch(
+    request: InferenceBatchRequest,
+    db: Session = Depends(get_db)
+):
+    """Run batched inference on multiple images."""
+    model = db.query(Model).filter(Model.id == request.model_id).first()
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {request.model_id} not found"
+        )
+
+    try:
+        results = InferenceService.predict_batch(
+            db=db,
+            model_id=request.model_id,
+            image_ids=request.image_ids,
+            conf_threshold=request.conf_threshold,
+            iou_threshold=request.iou_threshold,
+            batch_size=request.batch_size,
+            save_result_image=request.save_result_image,
+            save_to_db=request.save_to_db,
+        )
+        return {"results": results}
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Batch inference failed: {str(e)}"
         )
 
 
@@ -130,6 +195,52 @@ def compare_models(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Model comparison failed: {str(e)}"
+        )
+
+
+@router.post("/compare/batch")
+def compare_models_batch(
+    request: CompareBatchRequest,
+    db: Session = Depends(get_db)
+):
+    """Compare two models over multiple images in batch."""
+    model1 = db.query(Model).filter(Model.id == request.model_id_1).first()
+    if not model1:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {request.model_id_1} not found"
+        )
+
+    model2 = db.query(Model).filter(Model.id == request.model_id_2).first()
+    if not model2:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {request.model_id_2} not found"
+        )
+
+    try:
+        result = InferenceService.compare_models_batch(
+            db=db,
+            model_id_1=request.model_id_1,
+            model_id_2=request.model_id_2,
+            image_ids=request.image_ids,
+            conf_threshold=request.conf_threshold,
+            iou_threshold=request.iou_threshold,
+            batch_size=request.batch_size,
+            save_result_image=request.save_result_image,
+            save_to_db=request.save_to_db,
+            include_detections=request.include_detections,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Batch model comparison failed: {str(e)}"
         )
 
 
