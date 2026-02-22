@@ -7,8 +7,10 @@ pydantic-settings==2.1.0
 python-multipart==0.0.6
 websockets==12.0
 ultralytics==8.1.0
-torch==2.1.0
-torchvision==0.16.0
+# For NVIDIA GPU on Windows, install CUDA wheels with:
+# python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu124 torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
+torch==2.4.1
+torchvision==0.19.1
 opencv-python==4.9.0.80
 shapely==2.0.2
 Pillow==10.2.0

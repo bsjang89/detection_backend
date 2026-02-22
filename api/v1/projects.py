@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from typing import List, Literal, Set
 import shutil
 from pathlib import Path
@@ -241,7 +242,7 @@ async def upload_images(
         target_name = normalized_name
         renamed_from = None
 
-        # Handle duplicate filename policy
+        # Handle duplicate filename policy from known names
         if target_name in existing_names or (project_images_dir / target_name).exists():
             if duplicate_mode == "skip":
                 uploaded_images.append({
@@ -256,58 +257,111 @@ async def upload_images(
             target_name = _resolve_duplicate_filename(target_name, existing_names)
             renamed_from = normalized_name
 
-        file_path = project_images_dir / target_name
-        thumbnail_path = get_thumbnail_path(project_id, target_name)
-        viewer_path = get_viewer_path(project_id, target_name)
+        attempt = 0
+        max_attempts = 30
 
-        # Save original file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        while attempt < max_attempts:
+            file_path = project_images_dir / target_name
+            thumbnail_path = get_thumbnail_path(project_id, target_name)
+            viewer_path = get_viewer_path(project_id, target_name)
 
-        # Get image dimensions
-        try:
-            with PILImage.open(file_path) as img:
-                width, height = img.size
-            create_thumbnail(file_path, thumbnail_path, settings.THUMBNAIL_SIZE)
-            create_viewer_image(file_path, viewer_path)
-        except Exception as e:
-            if file_path.exists():
-                file_path.unlink()
-            if thumbnail_path.exists():
-                thumbnail_path.unlink()
-            if viewer_path.exists():
-                viewer_path.unlink()
+            try:
+                # Avoid accidental overwrite under concurrent uploads
+                if hasattr(file.file, "seek"):
+                    file.file.seek(0)
+                with open(file_path, "xb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+
+                with PILImage.open(file_path) as img:
+                    width, height = img.size
+
+                create_thumbnail(file_path, thumbnail_path, settings.THUMBNAIL_SIZE)
+                create_viewer_image(file_path, viewer_path)
+
+                db_image = Image(
+                    project_id=project_id,
+                    filename=target_name,
+                    file_path=str(file_path),
+                    width=width,
+                    height=height,
+                    split_type=SplitType.UNLABELED
+                )
+                db.add(db_image)
+                db.commit()
+                db.refresh(db_image)
+
+                uploaded_images.append({
+                    "id": db_image.id,
+                    "filename": target_name,
+                    "file_path": str(file_path),
+                    "thumbnail_path": str(thumbnail_path),
+                    "viewer_path": str(viewer_path),
+                    "width": width,
+                    "height": height,
+                    "status": "uploaded",
+                    "reason": None,
+                    "renamed_from": renamed_from,
+                })
+                existing_names.add(target_name)
+                break
+
+            except FileExistsError:
+                if duplicate_mode == "skip":
+                    uploaded_images.append({
+                        "id": None,
+                        "filename": normalized_name,
+                        "status": "skipped",
+                        "reason": "duplicate",
+                        "renamed_from": None,
+                    })
+                    break
+                existing_names.add(target_name)
+                target_name = _resolve_duplicate_filename(normalized_name, existing_names)
+                renamed_from = normalized_name
+                attempt += 1
+                continue
+
+            except IntegrityError:
+                db.rollback()
+                if file_path.exists():
+                    file_path.unlink()
+                if thumbnail_path.exists():
+                    thumbnail_path.unlink()
+                if viewer_path.exists():
+                    viewer_path.unlink()
+                if duplicate_mode == "skip":
+                    uploaded_images.append({
+                        "id": None,
+                        "filename": normalized_name,
+                        "status": "skipped",
+                        "reason": "duplicate",
+                        "renamed_from": None,
+                    })
+                    break
+                existing_names.add(target_name)
+                target_name = _resolve_duplicate_filename(normalized_name, existing_names)
+                renamed_from = normalized_name
+                attempt += 1
+                continue
+
+            except Exception:
+                db.rollback()
+                if file_path.exists():
+                    file_path.unlink()
+                if thumbnail_path.exists():
+                    thumbnail_path.unlink()
+                if viewer_path.exists():
+                    viewer_path.unlink()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid image file: {target_name}"
+                )
+
+        else:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid image file: {target_name}"
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Could not resolve duplicate filename for '{normalized_name}'"
             )
-
-        # Create database entry
-        db_image = Image(
-            project_id=project_id,
-            filename=target_name,
-            file_path=str(file_path),
-            width=width,
-            height=height,
-            split_type=SplitType.UNLABELED
-        )
-        db.add(db_image)
-        db.commit()
-        db.refresh(db_image)
-
-        uploaded_images.append({
-            "id": db_image.id,
-            "filename": target_name,
-            "file_path": str(file_path),
-            "thumbnail_path": str(thumbnail_path),
-            "viewer_path": str(viewer_path),
-            "width": width,
-            "height": height,
-            "status": "uploaded",
-            "reason": None,
-            "renamed_from": renamed_from,
-        })
-        existing_names.add(target_name)
 
     return uploaded_images
 
@@ -326,20 +380,35 @@ def create_class(
             detail=f"Project {project_id} not found"
         )
 
-    # Check if class_id already exists in this project
-    existing = db.query(Class).filter(
+    existing_by_id = db.query(Class).filter(
         Class.project_id == project_id,
         Class.class_id == class_data.class_id
     ).first()
-    if existing:
+    if existing_by_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Class ID {class_data.class_id} already exists in this project"
         )
+    existing_by_name = db.query(Class).filter(
+        Class.project_id == project_id,
+        Class.class_name == class_data.class_name
+    ).first()
+    if existing_by_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Class name '{class_data.class_name}' already exists in this project"
+        )
 
     db_class = Class(**class_data.model_dump())
     db.add(db_class)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Class already exists in this project"
+        )
     db.refresh(db_class)
 
     return db_class

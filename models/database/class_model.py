@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from config.database import Base
 
@@ -16,6 +16,6 @@ class Class(Base):
     annotations = relationship("Annotation", back_populates="class_obj", cascade="all, delete-orphan")
 
     __table_args__ = (
-        # Unique constraint: same class_id within a project
-        # Index for performance
+        UniqueConstraint("project_id", "class_id", name="uq_classes_project_class_id"),
+        UniqueConstraint("project_id", "class_name", name="uq_classes_project_class_name"),
     )

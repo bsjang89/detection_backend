@@ -57,4 +57,10 @@ class AnnotationResponse(AnnotationBase):
 # Batch operations
 class AnnotationBatchCreate(BaseModel):
     image_id: int
+    base_annotation_version: Optional[int] = None
     annotations: list[AnnotationBase]
+
+
+class AnnotationBatchResponse(BaseModel):
+    annotations: list[AnnotationResponse]
+    annotation_version: int

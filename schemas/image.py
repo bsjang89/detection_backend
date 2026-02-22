@@ -26,6 +26,7 @@ class ImageResponse(ImageBase):
     thumbnail_path: Optional[str] = None
     viewer_path: Optional[str] = None
     split_type: SplitType
+    annotation_version: int = 0
     uploaded_at: datetime
 
     class Config:

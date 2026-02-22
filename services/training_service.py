@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from typing import Dict, Any, Optional, Callable, Union, Set
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import platform
 import shutil
@@ -25,6 +25,10 @@ class TrainingService:
     # Track active training sessions
     _active_sessions: Dict[int, threading.Thread] = {}
     _stop_requests: Set[int] = set()
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
 
     @classmethod
     def start_training(
@@ -84,7 +88,7 @@ class TrainingService:
 
         # Update session status
         session.status = TrainingStatus.RUNNING
-        session.started_at = datetime.utcnow()
+        session.started_at = cls._utc_now()
         session.error_message = None
         db.commit()
 
@@ -187,7 +191,7 @@ class TrainingService:
                     # Cooperative stop request: stop at epoch boundary.
                     if training_session_id in cls._stop_requests:
                         session.status = TrainingStatus.STOPPED
-                        session.completed_at = datetime.utcnow()
+                        session.completed_at = cls._utc_now()
                         db.commit()
                         return True
 
@@ -205,7 +209,7 @@ class TrainingService:
             stop_requested = training_session_id in cls._stop_requests
 
             # Save results
-            session.completed_at = datetime.utcnow()
+            session.completed_at = cls._utc_now()
             session.best_weights_path = results.get('best_weights')
             session.last_weights_path = results.get('last_weights')
 
@@ -244,7 +248,7 @@ class TrainingService:
         except Exception as e:
             session.status = TrainingStatus.FAILED
             session.error_message = str(e)
-            session.completed_at = datetime.utcnow()
+            session.completed_at = cls._utc_now()
             db.commit()
             print(f"Training failed: {e}")
             import traceback
@@ -296,7 +300,7 @@ class TrainingService:
 
         # Update status
         session.status = TrainingStatus.STOPPED
-        session.completed_at = datetime.utcnow()
+        session.completed_at = cls._utc_now()
         db.commit()
 
         return {"status": "stopping", "message": "Stop requested"}

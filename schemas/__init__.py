@@ -20,6 +20,7 @@ from .annotation import (
     AnnotationUpdate,
     AnnotationResponse,
     AnnotationBatchCreate,
+    AnnotationBatchResponse,
 )
 from .training import (
     TrainingConfigSchema,
@@ -45,6 +46,7 @@ __all__ = [
     "AnnotationUpdate",
     "AnnotationResponse",
     "AnnotationBatchCreate",
+    "AnnotationBatchResponse",
     "TrainingConfigSchema",
     "TrainingSessionCreate",
     "TrainingSessionUpdate",

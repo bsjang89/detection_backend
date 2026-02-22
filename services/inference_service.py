@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from uuid import uuid4
 import cv2
 import numpy as np
 from shapely.geometry import Polygon
@@ -32,6 +33,11 @@ class InferenceService:
     _result_text_thickness = 2
     _result_jpeg_quality = 90
     _result_review_size = 1024
+
+    @classmethod
+    def _build_result_filename(cls, image_record: Image, model_id: int) -> str:
+        stem = Path(image_record.filename).stem
+        return f"{image_record.id}_{model_id}_{stem}_{uuid4().hex[:8]}.jpg"
 
     @classmethod
     def _load_model(
@@ -175,7 +181,7 @@ class InferenceService:
                     image_path=image_record.file_path,
                     detections=detections,
                     output_dir=Path(settings.RESULTS_DIR) / "inference" / str(model_id),
-                    filename=f"{image_record.id}_{Path(image_record.filename).stem}.jpg",
+                    filename=cls._build_result_filename(image_record, model_id),
                     conf_threshold=conf_threshold,
                     overlap_iou=0.5
                 )
@@ -184,7 +190,7 @@ class InferenceService:
                     image_path=image_record.file_path,
                     detections=detections,
                     output_dir=Path(settings.RESULTS_DIR) / "inference" / str(model_id),
-                    filename=f"{image_record.id}_{Path(image_record.filename).stem}.jpg"
+                    filename=cls._build_result_filename(image_record, model_id)
                 )
 
         inference_result_id = None
@@ -349,7 +355,7 @@ class InferenceService:
                                 "image_path": image_record.file_path,
                                 "detections": detections,
                                 "output_dir": Path(settings.RESULTS_DIR) / "inference" / str(model_id),
-                                "filename": f"{image_record.id}_{Path(image_record.filename).stem}.jpg",
+                                "filename": cls._build_result_filename(image_record, model_id),
                                 "conf_threshold": conf_threshold,
                                 "overlap_iou": None,
                                 "image_array": source_img,
@@ -365,7 +371,7 @@ class InferenceService:
                                 "image_path": image_record.file_path,
                                 "detections": detections,
                                 "output_dir": Path(settings.RESULTS_DIR) / "inference" / str(model_id),
-                                "filename": f"{image_record.id}_{Path(image_record.filename).stem}.jpg",
+                                "filename": cls._build_result_filename(image_record, model_id),
                                 "image_array": source_img,
                             },
                         ),
@@ -621,7 +627,7 @@ class InferenceService:
         output_dir = Path(settings.RESULTS_DIR) / "inference" / str(model_id)
 
         for idx, (image_record, source_img, row) in enumerate(zip(ordered_images, source_images, rows)):
-            filename = f"{image_record.id}_{Path(image_record.filename).stem}.jpg"
+            filename = cls._build_result_filename(image_record, model_id)
             if task_type == "obb":
                 future = pool.submit(
                     cls._draw_obb_detections,
