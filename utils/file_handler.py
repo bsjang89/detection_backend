@@ -20,6 +20,10 @@ def get_project_thumbnails_dir(project_id: int) -> Path:
     """Get project thumbnail directory"""
     return get_project_dir(project_id) / "thumbnails"
 
+def get_project_viewers_dir(project_id: int) -> Path:
+    """Get project viewer-optimized image directory"""
+    return get_project_dir(project_id) / "viewers"
+
 
 def safe_filename(filename: str) -> str:
     """Normalize uploaded filename and drop any directory part"""
@@ -35,6 +39,15 @@ def get_thumbnail_path(project_id: int, filename: str) -> Path:
     """Get absolute thumbnail path for a project image"""
     return get_project_thumbnails_dir(project_id) / get_thumbnail_filename(filename)
 
+def get_viewer_filename(filename: str) -> str:
+    """Build a deterministic viewer image filename"""
+    return f"{safe_filename(filename)}.view.jpg"
+
+
+def get_viewer_path(project_id: int, filename: str) -> Path:
+    """Get absolute viewer image path for a project image"""
+    return get_project_viewers_dir(project_id) / get_viewer_filename(filename)
+
 
 def create_thumbnail(source_path: Path, thumbnail_path: Path, max_size: int = 256) -> None:
     """Create a JPEG thumbnail that fits in max_size x max_size"""
@@ -47,6 +60,17 @@ def create_thumbnail(source_path: Path, thumbnail_path: Path, max_size: int = 25
         if thumb.mode not in ("RGB", "L"):
             thumb = thumb.convert("RGB")
         thumb.save(thumbnail_path, format="JPEG", quality=85, optimize=True)
+
+
+def create_viewer_image(source_path: Path, viewer_path: Path, quality: int = 82) -> None:
+    """Create viewer image with original size but compressed JPEG encoding."""
+    viewer_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with PILImage.open(source_path) as img:
+        view = img.copy()
+        if view.mode not in ("RGB", "L"):
+            view = view.convert("RGB")
+        view.save(viewer_path, format="JPEG", quality=quality, optimize=True, progressive=True)
 
 
 def get_project_dataset_dir(project_id: int) -> Path:

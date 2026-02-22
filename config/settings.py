@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     # CORS
     BACKEND_CORS_ORIGINS: list = ["http://localhost:5173", "http://localhost:3000"]
+    BACKEND_CORS_ORIGIN_REGEX: str = r"^https?://(localhost|127\.0\.0\.1|\d{1,3}(?:\.\d{1,3}){3})(:\d+)?$"
 
     class Config:
         env_file = ".env"

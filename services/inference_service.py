@@ -26,12 +26,12 @@ class InferenceService:
     _model_cache: Dict[int, Tuple[Any, float]] = {}
     _cache_lock = threading.RLock()
     _cache_max_size = 3
-    _result_box_thickness = 4
-    _result_text_scale_bbox = 0.5
-    _result_text_scale_obb = 0.6
+    _result_box_thickness = 5
+    _result_text_scale_bbox = 0.92
+    _result_text_scale_obb = 0.98
     _result_text_thickness = 2
-    _result_jpeg_quality = 75
-    _result_review_size = 512
+    _result_jpeg_quality = 90
+    _result_review_size = 1024
 
     @classmethod
     def _load_model(
@@ -711,16 +711,18 @@ class InferenceService:
 
             # Draw label
             label = f"Class {class_id}: {conf:.2f}"
-            text_y = max(50, y1 - 20)
-            cv2.putText(
-                img,
-                label,
-                (max(10, x1), text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                cls._result_text_scale_bbox,
-                color,
-                cls._result_text_thickness,
-                cv2.LINE_AA
+            label_x = max(8, x1)
+            label_y = y1 - int(30 * cls._result_text_scale_bbox)
+            if label_y < 6:
+                label_y = min(h - 6, y1 + 6)
+            cls._draw_label_with_bg(
+                img=img,
+                label=label,
+                x=label_x,
+                y=label_y,
+                accent_color=color,
+                font_scale=cls._result_text_scale_bbox,
+                text_thickness=cls._result_text_thickness,
             )
 
         cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
@@ -822,18 +824,20 @@ class InferenceService:
             # Draw polygon
             cv2.polylines(img, [pts], True, color, cls._result_box_thickness)
 
-            # Draw label at center
-            cx = int(pts[:, 0].mean())
-            cy = int(pts[:, 1].mean())
-            cv2.putText(
-                img,
-                label,
-                (max(10, cx - 120), max(50, cy - 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                cls._result_text_scale_obb,
-                color,
-                cls._result_text_thickness,
-                cv2.LINE_AA
+            # Draw label near top-most polygon point for readability.
+            top_idx = int(np.argmin(pts[:, 1]))
+            label_x = max(8, int(pts[top_idx, 0]) + 4)
+            label_y = int(pts[top_idx, 1]) - int(30 * cls._result_text_scale_obb)
+            if label_y < 6:
+                label_y = min(h - 6, int(pts[top_idx, 1]) + 6)
+            cls._draw_label_with_bg(
+                img=img,
+                label=label,
+                x=label_x,
+                y=label_y,
+                accent_color=color,
+                font_scale=cls._result_text_scale_obb,
+                text_thickness=cls._result_text_thickness,
             )
 
         cv2.imwrite(str(output_path), img, [cv2.IMWRITE_JPEG_QUALITY, cls._result_jpeg_quality])
@@ -843,7 +847,7 @@ class InferenceService:
     def _resize_to_square_review_with_transform(
         cls,
         img: np.ndarray,
-        target: int = 512
+        target: int = 1024
     ) -> Tuple[np.ndarray, float, int, int]:
         """
         Resize image to a square review frame while preserving aspect ratio.
@@ -859,7 +863,7 @@ class InferenceService:
         scale = min(target / float(w), target / float(h))
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
         resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
 
         canvas = np.zeros((target, target, 3), dtype=np.uint8)
@@ -869,10 +873,60 @@ class InferenceService:
         return canvas, scale, x, y
 
     @classmethod
-    def _resize_to_square_review(cls, img: np.ndarray, target: int = 512) -> np.ndarray:
+    def _resize_to_square_review(cls, img: np.ndarray, target: int = 1024) -> np.ndarray:
         """Backwards-compatible helper returning only review canvas image."""
         canvas, _, _, _ = cls._resize_to_square_review_with_transform(img, target)
         return canvas
+
+    @classmethod
+    def _draw_label_with_bg(
+        cls,
+        img: np.ndarray,
+        label: str,
+        x: int,
+        y: int,
+        accent_color: Tuple[int, int, int],
+        font_scale: float,
+        text_thickness: int,
+    ) -> None:
+        """Draw high-contrast label text with rounded-looking background and border."""
+        h, w = img.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
+        pad_x = 8
+        pad_y = 6
+        box_w = text_w + pad_x * 2
+        box_h = text_h + baseline + pad_y * 2
+
+        x1 = max(0, min(w - box_w - 1, x))
+        y1 = max(0, min(h - box_h - 1, y))
+        x2 = min(w - 1, x1 + box_w)
+        y2 = min(h - 1, y1 + box_h)
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), (10, 18, 33), thickness=-1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), accent_color, thickness=1)
+
+        text_org = (x1 + pad_x, y1 + pad_y + text_h)
+        cv2.putText(
+            img,
+            label,
+            text_org,
+            font,
+            font_scale,
+            (0, 0, 0),
+            text_thickness + 2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            img,
+            label,
+            text_org,
+            font,
+            font_scale,
+            (245, 248, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
 
     @staticmethod
     def _polygon_iou(p1: np.ndarray, p2: np.ndarray) -> float:

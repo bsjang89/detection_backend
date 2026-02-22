@@ -9,7 +9,14 @@ from PIL import Image as PILImage
 from config.database import get_db
 from config.settings import settings
 from models.database import Project, Image, Annotation, Class, SplitType
-from utils.file_handler import create_thumbnail, get_project_images_dir, get_thumbnail_path, safe_filename
+from utils.file_handler import (
+    create_thumbnail,
+    create_viewer_image,
+    get_project_images_dir,
+    get_thumbnail_path,
+    get_viewer_path,
+    safe_filename,
+)
 from schemas import (
     ProjectCreate,
     ProjectUpdate,
@@ -251,6 +258,7 @@ async def upload_images(
 
         file_path = project_images_dir / target_name
         thumbnail_path = get_thumbnail_path(project_id, target_name)
+        viewer_path = get_viewer_path(project_id, target_name)
 
         # Save original file
         with open(file_path, "wb") as buffer:
@@ -261,11 +269,14 @@ async def upload_images(
             with PILImage.open(file_path) as img:
                 width, height = img.size
             create_thumbnail(file_path, thumbnail_path, settings.THUMBNAIL_SIZE)
+            create_viewer_image(file_path, viewer_path)
         except Exception as e:
             if file_path.exists():
                 file_path.unlink()
             if thumbnail_path.exists():
                 thumbnail_path.unlink()
+            if viewer_path.exists():
+                viewer_path.unlink()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid image file: {target_name}"
@@ -289,6 +300,7 @@ async def upload_images(
             "filename": target_name,
             "file_path": str(file_path),
             "thumbnail_path": str(thumbnail_path),
+            "viewer_path": str(viewer_path),
             "width": width,
             "height": height,
             "status": "uploaded",
